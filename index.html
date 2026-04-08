@@ -184,6 +184,12 @@ input,textarea,select{font-family:var(--font)}
         </div>
       </div>
       <div class="form-group"><label class="form-label">กำหนดส่ง</label><input class="form-input" id="input-deadline" type="datetime-local"></div>
+      <div class="form-group"><label class="form-label">ทำซ้ำ</label><select class="form-select" id="input-recurrence">
+        <option value="none">ไม่ทำซ้ำ</option>
+        <option value="daily">ทุกวัน</option>
+        <option value="weekly">ทุกสัปดาห์</option>
+        <option value="monthly">ทุกเดือน</option>
+      </select></div>
       <div class="form-group"><label class="form-label">Tags (คั่นด้วย ,)</label><input class="form-input" id="input-tags" placeholder="เช่น urgent, ฝ่ายขาย"></div>
       <button class="btn btn-gradient" id="btn-submit-task" onclick="submitTask()"><span>✓</span> <span id="btn-submit-label">สร้างงาน</span></button>
     </div>
@@ -254,13 +260,15 @@ async function init() {
     S.profile = await liff.getProfile();
 
     setLoadingMsg('กำลังโหลดข้อมูล...');
-    const [user, staff] = await Promise.all([
-      gas('getUserByLineId', S.profile.userId),
-      gas('getAllStaff'),
-    ]);
-    if (!user) { showError('ไม่พบข้อมูลของคุณในระบบ\nกรุณาติดต่อผู้ดูแลระบบ'); return; }
-    S.user = user; S.staff = staff;
-    S.todos = await gas('getTodos', S.profile.userId, user.role);
+    // ใช้ cache + endpoint เดียวเพื่อความเร็ว
+    try {
+      const cached = JSON.parse(localStorage.getItem('tm_staff_cache') || 'null');
+      if (cached && (Date.now() - cached.t) < 3600000) S.staff = cached.staff;
+    } catch (_) {}
+    const init = await gas('getInitialData', S.profile.userId);
+    if (!init || !init.user) { showError('ไม่พบข้อมูลของคุณในระบบ\nกรุณาติดต่อผู้ดูแลระบบ'); return; }
+    S.user = init.user; S.staff = init.staff || S.staff; S.todos = init.todos || [];
+    try { localStorage.setItem('tm_staff_cache', JSON.stringify({ t: Date.now(), staff: S.staff })); } catch(_) {}
     renderApp();
     hideLoading();
   } catch (err) {
@@ -275,7 +283,7 @@ function renderApp() {
   const ROLE_LABELS = { boss:'Boss', manager:'Manager', employee:'Staff' };
   badge.textContent = ROLE_LABELS[S.user.role] || S.user.role;
   badge.className = 'role-badge role-' + S.user.role;
-  if (S.user.role === 'employee') document.getElementById('fab-create').classList.add('hidden');
+  // Staff สร้างงานให้ตัวเองได้
   renderStats(); renderTabs(); renderTasks();
   document.getElementById('app').classList.remove('hidden');
 }
@@ -399,6 +407,7 @@ function openCreateModal() {
   document.getElementById('modal-create-title').textContent = 'สร้างงานใหม่';
   document.getElementById('btn-submit-label').textContent = 'สร้างงาน';
   ['input-title','input-desc','input-deadline','input-tags'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('input-recurrence').value = 'none';
   setPriority('medium'); populateAssignee(null);
   closeModal('modal-detail'); openModal('modal-create');
 }
@@ -417,17 +426,28 @@ function openEditModal(todoId) {
     const pad = n => String(n).padStart(2,'0');
     document.getElementById('input-deadline').value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
+  document.getElementById('input-recurrence').value = t.recurrence || 'none';
   setPriority(t.priority); populateAssignee(t.assignedTo);
   closeModal('modal-detail'); openModal('modal-create');
 }
 
 function populateAssignee(selectedId) {
   const role = S.user.role;
-  let choices = S.staff.filter(s => s.lineUserId !== S.profile.userId);
-  if (role === 'manager') choices = choices.filter(s => s.department === S.user.department || s.role === 'employee');
-  document.getElementById('input-assignee').innerHTML = choices.map(s =>
-    `<option value="${s.lineUserId}" data-name="${escAttr(s.name)}" ${s.lineUserId === selectedId ? 'selected' : ''}>${escHtml(s.name)} (${s.role})</option>`
-  ).join('');
+  const sel = document.getElementById('input-assignee');
+  let choices;
+  if (role === 'employee') {
+    // Staff: บังคับมอบหมายให้ตัวเอง
+    choices = [{ lineUserId: S.profile.userId, name: S.user.name + ' (ฉัน)' }];
+    sel.disabled = true;
+  } else {
+    choices = S.staff.slice();
+    if (role === 'manager') choices = choices.filter(s => s.department === S.user.department || s.role === 'employee');
+    sel.disabled = false;
+  }
+  sel.innerHTML = choices.map(s => {
+    const sid = role === 'employee' ? S.profile.userId : s.lineUserId;
+    return `<option value="${sid}" data-name="${escAttr(s.name)}" ${sid === selectedId ? 'selected' : ''}>${escHtml(s.name)}</option>`;
+  }).join('');
 }
 
 function setPriority(p) {
@@ -443,6 +463,7 @@ async function submitTask() {
   const desc = document.getElementById('input-desc').value.trim();
   const deadline = document.getElementById('input-deadline').value;
   const tags = document.getElementById('input-tags').value.trim();
+  const recurrence = document.getElementById('input-recurrence').value;
   const sel = document.getElementById('input-assignee');
   const assignedTo = sel.value;
   const assignedToName = sel.options[sel.selectedIndex]?.dataset.name || '';
@@ -453,10 +474,10 @@ async function submitTask() {
   document.getElementById('btn-submit-label').textContent = 'กำลังบันทึก...';
   try {
     if (S.editingId) {
-      await gas('updateTodo', S.editingId, { title, description:desc, assignedTo, assignedToName, priority:S.priority, deadline:deadline || null, tags });
+      await gas('updateTodo', S.editingId, { title, description:desc, assignedTo, assignedToName, priority:S.priority, deadline:deadline || null, tags, recurrence });
       showToast('✅ แก้ไขงานเรียบร้อย', 'success');
     } else {
-      await gas('createTodo', { title, description:desc, assignedTo, assignedToName, assignedBy:S.profile.userId, assignedByName:S.user.name, priority:S.priority, deadline:deadline || null, tags });
+      await gas('createTodo', { title, description:desc, assignedTo, assignedToName, assignedBy:S.profile.userId, assignedByName:S.user.name, priority:S.priority, deadline:deadline || null, tags, recurrence });
       showToast('✅ สร้างงานเรียบร้อย', 'success');
     }
     closeModal('modal-create');
